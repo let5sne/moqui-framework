@@ -18,8 +18,11 @@ import org.moqui.context.L10nFacade;
 import org.moqui.entity.EntityValue;
 import org.moqui.entity.EntityFind;
 
+import groovy.json.JsonOutput;
+
 import javax.xml.bind.DatatypeConverter;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.text.NumberFormat;
 import java.sql.Date;
 import java.sql.Time;
@@ -113,7 +116,15 @@ public class L10nFacadeImpl implements L10nFacade {
             }
         }
 
-        Currency currency = uomId != null && uomId.length() > 0 ? Currency.getInstance(uomId) : null;
+        Currency currency = null;
+        if (uomId != null && uomId.length() > 0) {
+            try {
+                currency = Currency.getInstance(uomId);
+            } catch (Exception e) {
+                if (logger.isTraceEnabled()) logger.trace("Ignoring IllegalArgumentException for Currency parse: " + e.toString());
+            }
+        }
+
         if (locale == null) locale = getLocale();
         if (currency != null) {
             NumberFormat nf = NumberFormat.getCurrencyInstance(locale);
@@ -129,6 +140,22 @@ public class L10nFacadeImpl implements L10nFacade {
             nf.setMinimumFractionDigits(fractionDigits);
             return nf.format(amount);
         }
+    }
+
+    @Override
+    public BigDecimal roundCurrency(BigDecimal amount, String uomId) { return roundCurrency(amount, uomId, false); }
+    @Override
+    public BigDecimal roundCurrency(BigDecimal amount, String uomId, boolean precise) { return roundCurrency(amount, uomId, false, RoundingMode.HALF_UP); }
+    @Override
+    public BigDecimal roundCurrency(BigDecimal amount, String uomId, boolean precise, int roundingMethod) {
+        return roundCurrency(amount, uomId, precise, RoundingMode.valueOf(roundingMethod));
+    }
+    @Override
+    public BigDecimal roundCurrency(BigDecimal amount, String uomId, boolean precise, RoundingMode mode) {
+        Currency currency = Currency.getInstance(uomId);
+        int nDigits = currency.getDefaultFractionDigits();
+        if (precise) nDigits++;
+        return amount.setScale(nDigits, mode);
     }
 
     @Override
@@ -200,7 +227,7 @@ public class L10nFacadeImpl implements L10nFacade {
 
         // try interpreting the String as a long
         try {
-            Long lng = Long.valueOf(input);
+            long lng = Long.parseLong(input);
             return new java.sql.Date(lng);
         } catch (NumberFormatException e) {
             if (logger.isTraceEnabled()) logger.trace("Ignoring NumberFormatException for Date parse: " + e.toString());
@@ -245,9 +272,9 @@ public class L10nFacadeImpl implements L10nFacade {
         // long values are pretty common, so if there are no special characters try that first (fast to check)
         if (cal == null) {
             int nonDigits = ObjectUtilities.countChars(input, false, true, true);
-            if (nonDigits == 0) {
+            if (nonDigits == 0 || (nonDigits == 1 && input.startsWith("-"))) {
                 try {
-                    Long lng = Long.valueOf(input);
+                    long lng = Long.parseLong(input);
                     return new Timestamp(lng);
                 } catch (NumberFormatException e) {
                     if (logger.isTraceEnabled()) logger.trace("Ignoring NumberFormatException for Timestamp parse: " + e.toString());
@@ -285,7 +312,7 @@ public class L10nFacadeImpl implements L10nFacade {
 
     @Override public Calendar parseDateTime(String input, String format) {
         return calendarValidator.validate(input, format, getLocale(), getTimeZone()); }
-    public String formatDateTime(Calendar input, String format, Locale locale, TimeZone tz) {
+    @Override public String formatDateTime(Calendar input, String format, Locale locale, TimeZone tz) {
         if (locale == null) locale = getLocale();
         if (tz == null) tz = getTimeZone();
         return calendarValidator.format(input, format, locale, tz);
@@ -293,9 +320,19 @@ public class L10nFacadeImpl implements L10nFacade {
 
     @Override public BigDecimal parseNumber(String input, String format) {
         return bigDecimalValidator.validate(input, format, getLocale()); }
-    public String formatNumber(Number input, String format, Locale locale) {
+    @Override public String formatNumber(Number input, String format, Locale locale) {
         if (locale == null) locale = getLocale();
-        return bigDecimalValidator.format(input, format, locale);
+        if (format == null || format.isEmpty()) {
+            // BigDecimalValidator defaults to 3 decimal digits, if no format specified we don't want to truncate so small, use better defaults
+            NumberFormat nf = locale != null ? NumberFormat.getNumberInstance(locale) : NumberFormat.getNumberInstance();
+            nf.setMinimumFractionDigits(0);
+            nf.setMaximumFractionDigits(12);
+            nf.setMinimumIntegerDigits(1);
+            nf.setGroupingUsed(true);
+            return nf.format(input);
+        } else {
+            return bigDecimalValidator.format(input, format, locale);
+        }
     }
 
     @Override
@@ -307,7 +344,7 @@ public class L10nFacadeImpl implements L10nFacade {
         if (value == null) return "";
         if (locale == null) locale = getLocale();
         if (tz == null) tz = getTimeZone();
-        Class valueClass = value.getClass();
+        Class<?> valueClass = value.getClass();
         if (valueClass == String.class) return (String) value;
         if (valueClass == Timestamp.class) return formatTimestamp((Timestamp) value, format, locale, tz);
         if (valueClass == java.util.Date.class) return formatTimestamp((java.util.Date) value, format, locale, tz);
@@ -317,6 +354,11 @@ public class L10nFacadeImpl implements L10nFacade {
         if (value instanceof Number) return formatNumber((Number) value, format, locale);
         // Calendar is an abstract class, so must use instanceof here as well
         if (value instanceof Calendar) return formatDateTime((Calendar) value, format, locale, tz);
+        // support formatting of Map and Collection using JSON
+        if (value instanceof Map || value instanceof Collection) {
+            String json = JsonOutput.toJson(value);
+            return (json.length() > 128) ? JsonOutput.prettyPrint(json) : json;
+        }
         return value.toString();
     }
 }
